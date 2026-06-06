@@ -1,2 +1,4 @@
 models/
 llama
+llama_mkl
+llama_openblas

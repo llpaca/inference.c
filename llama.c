@@ -6,28 +6,54 @@
  *   - RMSNorm, RoPE, GQA (Grouped Query Attention)
  *   - SwiGLU feed-forward network
  *   - Greedy & temperature sampling
+ *   - Switchable BLAS backend: OpenBLAS (default) or Intel MKL
  *
- * Build:
- *   gcc -O3 -march=native -o llama llama.c -lm
+ * ─────────────────────── Build Instructions ────────────────────────────
  *
- * Usage:
- *   ./llama <model_dir> "<prompt>" [max_tokens] [temperature]
+ *  OpenBLAS (default):
+ *    gcc -O3 -march=native -o llama llama.c -lm -lopenblas
  *
- * model_dir should contain:
- *   model.safetensors  (or model-00001-of-00002.safetensors etc.)
- *   tokenizer.json
+ *  Intel MKL:
+ *    gcc -O3 -march=native -DUSE_MKL -o llama_mkl llama.c -lm -lmkl_rt
  *
- * Fixes applied vs original:
- *   1. find_merges_array() - scope-aware JSON walk to find the real
- *      merges array inside model{} instead of strstr() false-matching
- *      a nested object earlier in the file.
- *   2. tok_encode() - reads full UTF-8 codepoints then encodes each
- *      constituent byte through the GPT-2 byte encoder, instead of
- *      feeding raw bytes one at a time (which breaks multi-byte input).
- *   3. Token decode output - uses fwrite() with vocab_lens[] so raw
- *      byte strings print correctly; removes the broken Ġ special-case
- *      (vocab[] already stores decoded raw bytes, spaces are 0x20).
+ *  With explicit include paths (if needed):
+ *    # OpenBLAS
+ *    gcc -O3 -march=native -o llama llama.c -lm -lopenblas \
+ *        -I/usr/include/x86_64-linux-gnu
+ *    # MKL
+ *    gcc -O3 -march=native -DUSE_MKL -o llama_mkl llama.c -lm -lmkl_rt \
+ *        -I/usr/include/mkl
+ *
+ *  Quick benchmark (both backends, same prompt):
+ *    ./bench.sh <model_dir> "<prompt>" [max_tokens]
+ *    (bench.sh is generated alongside this file)
+ *
+ * ────────────────────────── Usage ──────────────────────────────────────
+ *
+ *  ./llama     <model_dir> "<prompt>" [max_tokens] [temperature]
+ *  ./llama_mkl <model_dir> "<prompt>" [max_tokens] [temperature]
+ *
+ *  model_dir should contain:
+ *    model.safetensors  (or model-00001-of-00002.safetensors etc.)
+ *    tokenizer.json
+ *
+ * ───────────────────────── Backend Notes ───────────────────────────────
+ *
+ *  Both backends expose an identical cblas_sgemv interface.
+ *  MKL is Intel's proprietary library, highly tuned for Intel CPUs:
+ *    - Dispatches at runtime to the best AVX/AVX2/AVX-512 kernel
+ *    - Better cache blocking on Intel microarchitectures
+ *    - Typically 10-40% faster than OpenBLAS on Intel hardware
+ *    - On AMD CPUs, OpenBLAS often wins or ties
+ *  OpenBLAS is open-source and portable; performs well on both x86 and ARM.
+ *
+ *  BLAS_BACKEND env var (runtime switch for the MKL binary):
+ *    MKL_VERBOSE=1 ./llama_mkl ...    # show MKL dispatch decisions
+ *    MKL_NUM_THREADS=1 ./llama_mkl ... # force single-threaded MKL
  */
+
+/* Required for clock_gettime, strdup, and other POSIX extensions */
+#define _POSIX_C_SOURCE 200809L
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -43,7 +69,23 @@
 #include <unistd.h>
 #include <errno.h>
 
-/* ─────────────────────────── model config ─────────────────────────── */
+/* ─────────────────────────── BLAS Backend ──────────────────────────────
+ *
+ *  Compile with -DUSE_MKL  → Intel MKL  (link: -lmkl_rt)
+ *  Default (no flag)       → OpenBLAS   (link: -lopenblas)
+ *
+ *  Both provide identical cblas_sgemv, so all math code below is
+ *  100% shared — only the header and the runtime banner differ.
+ */
+#ifdef USE_MKL
+  #include <mkl_cblas.h>
+  #define BLAS_BACKEND_NAME "Intel MKL"
+#else
+  #include <cblas.h>
+  #define BLAS_BACKEND_NAME "OpenBLAS"
+#endif
+
+/* ─────────────────────────── model config ──────────────────────────── */
 
 typedef struct {
     int   dim;           /* hidden size                  (2048) */
@@ -74,7 +116,7 @@ static Config llama32_1b_config(void) {
     return c;
 }
 
-/* ─────────────────────────── safetensors ──────────────────────────── */
+/* ─────────────────────────── safetensors ───────────────────────────── */
 
 typedef enum { ST_F32 = 0, ST_BF16 = 1, ST_I32 = 2, ST_F16 = 3, ST_UNKNOWN } STDtype;
 
@@ -315,7 +357,7 @@ static float* st_get_f32(SafeTensors *st, STTensor *t, float *scratch, int n) {
     }
 }
 
-/* ─────────────────────────── model weights ────────────────────────── */
+/* ─────────────────────────── model weights ─────────────────────────── */
 
 typedef struct {
     float  *embed_tokens;
@@ -422,7 +464,7 @@ static int load_weights(Weights *w, Config *cfg, SafeTensors *st) {
 #undef COPY
 }
 
-/* ─────────────────────────── tokenizer ────────────────────────────── */
+/* ─────────────────────────── tokenizer ─────────────────────────────── */
 
 static void build_byte_decoder(uint32_t enc[256], uint8_t dec[1024]) {
     memset(dec, 0xff, 1024);
@@ -557,15 +599,6 @@ static int read_json_str(const char **pp, char *out, int max) {
     return j;
 }
 
-/* ── FIX 1: scope-aware search for the merges array ──
- *
- * The old code used strstr(model_sec, "\"merges\"") which could match
- * the string "merges" inside a nested object (e.g. decoder config) that
- * appears before the actual BPE merge list in the file.  This walks
- * the top-level keys of the "model" object and returns a pointer
- * directly at the '[' of the merges array.
- */
-
 /* Skip a complete JSON value starting at *p; return pointer past it. */
 static const char* skip_json_value(const char *p) {
     while (*p==' '||*p=='\n'||*p=='\r'||*p=='\t') p++;
@@ -592,29 +625,25 @@ static const char* skip_json_value(const char *p) {
         }
         return p;
     }
-    /* number / true / false / null */
     while (*p && *p!=',' && *p!='}' && *p!=']' && *p!=' ' && *p!='\n' && *p!='\r') p++;
     return p;
 }
 
 static const char* find_merges_array(const char *js) {
-    /* Locate the top-level "model" key */
     const char *p = strstr(js, "\"model\"");
     if (!p) return NULL;
-    p += 7; /* skip past "model" */
+    p += 7;
     while (*p==' '||*p=='\n'||*p=='\r'||*p=='\t') p++;
     if (*p!=':') return NULL; p++;
     while (*p==' '||*p=='\n'||*p=='\r'||*p=='\t') p++;
-    if (*p!='{') return NULL; p++; /* enter model object */
+    if (*p!='{') return NULL; p++;
 
-    /* Walk the keys inside model{} */
     while (*p) {
         while (*p==' '||*p=='\n'||*p=='\r'||*p=='\t') p++;
         if (*p=='}' || !*p) break;
         if (*p==',') { p++; continue; }
         if (*p!='"') { p++; continue; }
 
-        /* Read key */
         p++;
         char key[64]={0}; int ki=0;
         while (*p && *p!='"') {
@@ -630,11 +659,10 @@ static const char* find_merges_array(const char *js) {
         while (*p==' '||*p=='\n'||*p=='\r'||*p=='\t') p++;
 
         if (strcmp(key,"merges")==0) {
-            if (*p=='[') return p; /* found it */
+            if (*p=='[') return p;
             break;
         }
 
-        /* Skip this value and move to the next key */
         p = skip_json_value(p);
     }
     return NULL;
@@ -753,12 +781,11 @@ static int tok_load(Tokenizer *tok, const char *path) {
     }
     printf("[tokenizer] vocab entries loaded: %d\n", loaded);
 
-    /* ── 3. Parse merges (FIX: use scope-aware finder) ── */
+    /* ── 3. Parse merges ── */
     int merge_cap = 300000;
     tok->merges   = (Merge*)malloc(merge_cap * sizeof(Merge));
     tok->n_merges = 0;
 
-    /* Build enc_vocab lookup map */
     g_hm = (HMEntry*)calloc(HASHMAP_CAP, sizeof(HMEntry));
     for (int i=0; i<tok->vocab_size; i++)
         if (tok->enc_vocab[i]) hm_set(tok->enc_vocab[i], i);
@@ -768,7 +795,7 @@ static int tok_load(Tokenizer *tok, const char *path) {
         fprintf(stderr,"[tokenizer] WARNING: could not find merges array\n");
     } else {
         const char *mp = merges_arr;
-        if (*mp == '[') mp++; /* step past '[' */
+        if (*mp == '[') mp++;
 
         while (*mp && tok->n_merges < merge_cap) {
             while (*mp==' '||*mp=='\n'||*mp=='\r'||*mp=='\t') mp++;
@@ -779,7 +806,6 @@ static int tok_load(Tokenizer *tok, const char *path) {
             char merge_str[256];
             read_json_str(&mp, merge_str, sizeof(merge_str));
 
-            /* merge_str = "tok_a tok_b" separated by a single space */
             char *space = strchr(merge_str, ' ');
             if (!space) continue;
             *space = 0;
@@ -813,10 +839,6 @@ static int tok_load(Tokenizer *tok, const char *path) {
     return 0;
 }
 
-/* ── GPT-2 byte encoder helper ──
- * Encodes a single raw byte through the GPT-2 byte encoder into its
- * UTF-8 representation and writes it to out[].  Returns bytes written.
- */
 static int byte_to_gpt2_str(uint8_t byte, uint32_t byte_enc[256], char *out) {
     uint32_t enc = byte_enc[byte];
     int len = 0;
@@ -834,14 +856,6 @@ static int byte_to_gpt2_str(uint8_t byte, uint32_t byte_enc[256], char *out) {
     return len;
 }
 
-/* ── FIX 2: BPE encoder reads whole UTF-8 codepoints ──
- *
- * The old version fed raw bytes one at a time, which broke on multi-byte
- * UTF-8 input (each continuation byte was encoded independently, producing
- * wrong GPT-2 tokens).  We now decode each UTF-8 codepoint, then encode
- * every constituent byte of that codepoint through the GPT-2 byte encoder
- * and concatenate them into one lookup key before searching the vocab.
- */
 static int tok_encode(Tokenizer *tok, const char *text, int *ids, int max_ids) {
     int seq_cap = 65536;
     int *seq = (int*)malloc(seq_cap * sizeof(int));
@@ -850,24 +864,20 @@ static int tok_encode(Tokenizer *tok, const char *text, int *ids, int max_ids) {
 
     const uint8_t *p = (const uint8_t*)text;
     while (*p && seq_len < seq_cap - 1) {
-        /* Decode one UTF-8 codepoint and record its byte length */
         uint32_t cp;
         int cp_bytes;
         if      ((*p & 0x80) == 0x00) { cp = *p;                                                           cp_bytes = 1; }
         else if ((*p & 0xe0) == 0xc0) { cp = ((uint32_t)(p[0]&0x1f)<<6)  |  (p[1]&0x3f);                  cp_bytes = 2; }
         else if ((*p & 0xf0) == 0xe0) { cp = ((uint32_t)(p[0]&0x0f)<<12) | ((uint32_t)(p[1]&0x3f)<<6) | (p[2]&0x3f); cp_bytes = 3; }
         else if ((*p & 0xf8) == 0xf0) { cp = ((uint32_t)(p[0]&0x07)<<18) | ((uint32_t)(p[1]&0x3f)<<12)| ((uint32_t)(p[2]&0x3f)<<6)|(p[3]&0x3f); cp_bytes = 4; }
-        else                           { cp = *p; cp_bytes = 1; } /* invalid byte: treat as Latin-1 */
+        else                           { cp = *p; cp_bytes = 1; }
 
-        /* Re-encode the codepoint as UTF-8 bytes (same as input for valid UTF-8),
-           then map each byte through the GPT-2 byte encoder */
         uint8_t utf8[4]; int nb = 0;
         if      (cp < 0x80)    { utf8[0] = (uint8_t)cp; nb = 1; }
         else if (cp < 0x800)   { utf8[0] = 0xc0|(cp>>6); utf8[1] = 0x80|(cp&0x3f); nb = 2; }
         else if (cp < 0x10000) { utf8[0] = 0xe0|(cp>>12); utf8[1] = 0x80|((cp>>6)&0x3f); utf8[2] = 0x80|(cp&0x3f); nb = 3; }
         else                   { utf8[0] = 0xf0|(cp>>18); utf8[1] = 0x80|((cp>>12)&0x3f); utf8[2] = 0x80|((cp>>6)&0x3f); utf8[3] = 0x80|(cp&0x3f); nb = 4; }
 
-        /* Build the GPT-2-encoded string for this codepoint */
         char gpt2_str[32]; int glen = 0;
         for (int b = 0; b < nb; b++)
             glen += byte_to_gpt2_str(utf8[b], tok->byte_enc, gpt2_str + glen);
@@ -877,7 +887,6 @@ static int tok_encode(Tokenizer *tok, const char *text, int *ids, int max_ids) {
         if (id >= 0) {
             seq[seq_len++] = id;
         }
-        /* If not found (shouldn't happen with a complete vocab), skip the codepoint */
 
         p += cp_bytes;
     }
@@ -927,19 +936,38 @@ static void rmsnorm(float *out, const float *x, const float *w, int dim) {
     for (int i=0; i<dim; i++) out[i] = w[i] * (ss * x[i]);
 }
 
+/*
+ * matmul / matmul_acc
+ * ───────────────────
+ * out[out_dim] = W[out_dim × in_dim] · x[in_dim]  (row-major W)
+ *
+ * Dispatches to cblas_sgemv from whichever library was compiled in:
+ *   - OpenBLAS: open-source, great on AMD & ARM
+ *   - Intel MKL: Intel-proprietary, fastest on Intel CPUs (AVX-512 etc.)
+ *
+ * The function signature is identical between the two libraries, so
+ * all math code is 100% shared — only the #include and link flag differ.
+ *
+ * cblas_sgemv(order, trans, M, N, alpha, A, lda, x, incx, beta, y, incy)
+ *   CblasRowMajor + CblasNoTrans + M=out_dim + N=in_dim  →  y = A · x
+ *   beta=0 for matmul (overwrite), beta=1 for matmul_acc (accumulate).
+ */
+static void matmul(float *out, const float *x, const float *W,
+                   int out_dim, int in_dim) {
+    cblas_sgemv(CblasRowMajor, CblasNoTrans,
+                out_dim, in_dim,
+                1.0f, W, in_dim,
+                x, 1,
+                0.0f, out, 1);
+}
+
 static void matmul_acc(float *out, const float *x, const float *W,
                         int out_dim, int in_dim) {
-    for (int i=0; i<out_dim; i++) {
-        float v = 0.0f;
-        const float *row = W + (size_t)i * in_dim;
-        for (int j=0; j<in_dim; j++) v += row[j]*x[j];
-        out[i] += v;
-    }
-}
-static void matmul(float *out, const float *x, const float *W,
-                    int out_dim, int in_dim) {
-    memset(out, 0, out_dim * sizeof(float));
-    matmul_acc(out, x, W, out_dim, in_dim);
+    cblas_sgemv(CblasRowMajor, CblasNoTrans,
+                out_dim, in_dim,
+                1.0f, W, in_dim,
+                x, 1,
+                1.0f, out, 1);
 }
 
 static void softmax(float *x, int n) {
@@ -981,7 +1009,7 @@ static void rope(float *q, float *k, int head_dim, int n_heads, int n_kv_heads,
     }
 }
 
-/* ─────────────────────────── run state ────────────────────────────── */
+/* ─────────────────────────── run state ─────────────────────────────── */
 
 typedef struct {
     float *x;
@@ -1147,6 +1175,15 @@ static int sample_temperature(float *logits, int n, float temp) {
     return n-1;
 }
 
+/* ─────────────────────────── timing helper ─────────────────────────── */
+
+/* Returns wall-clock seconds as a double */
+static double now_sec(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
 /* ─────────────────────────── main ─────────────────────────────────── */
 
 int main(int argc, char *argv[]) {
@@ -1156,8 +1193,14 @@ int main(int argc, char *argv[]) {
             "\n"
             "  model_dir      directory with model.safetensors and tokenizer.json\n"
             "  max_tokens     default 200\n"
-            "  temperature    0 = greedy, >0 = sampling (default 0)\n",
-            argv[0]);
+            "  temperature    0 = greedy, >0 = sampling (default 0)\n"
+            "\n"
+            "BLAS backend compiled in: %s\n"
+            "\n"
+            "Build variants:\n"
+            "  OpenBLAS:   gcc -O3 -march=native -o llama      llama.c -lm -lopenblas\n"
+            "  Intel MKL:  gcc -O3 -march=native -DUSE_MKL -o llama_mkl llama.c -lm -lmkl_rt\n",
+            argv[0], BLAS_BACKEND_NAME);
         return 1;
     }
 
@@ -1168,13 +1211,18 @@ int main(int argc, char *argv[]) {
 
     srand((unsigned)time(NULL));
 
+    /* Banner */
+    printf("╔══════════════════════════════════════╗\n");
+    printf("║  llama.c  │  BLAS: %-17s║\n", BLAS_BACKEND_NAME);
+    printf("╚══════════════════════════════════════╝\n");
+
     /* Config */
     Config cfg = llama32_1b_config();
     printf("[config] dim=%d layers=%d heads=%d kv_heads=%d ff=%d vocab=%d\n",
            cfg.dim, cfg.n_layers, cfg.n_heads, cfg.n_kv_heads,
            cfg.ff_dim, cfg.vocab_size);
 
-    /* Open safetensors — try common filename conventions */
+    /* Open safetensors */
     char st_path[512];
     const char *candidates[] = {
         "%s/model.safetensors",
@@ -1224,11 +1272,14 @@ int main(int argc, char *argv[]) {
     int n_prompt = tok_encode(&tok, prompt, ids+1, 4095) + 1;
     printf("[encode] Prompt tokens: %d\n", n_prompt);
     printf("\n--- Output ---\n");
-    /* FIX 3: use fwrite for raw-byte vocab strings */
     fwrite(prompt, 1, strlen(prompt), stdout);
     fflush(stdout);
 
-    /* Inference loop */
+    /* Inference loop — timed */
+    double t_prefill_start = now_sec();
+    double t_first_token   = 0.0;
+    int    n_generated     = 0;
+
     int next_token = 0;
     int total = n_prompt + max_tokens;
     if (total > cfg.max_seq_len) total = cfg.max_seq_len;
@@ -1236,6 +1287,11 @@ int main(int argc, char *argv[]) {
     for (int pos=0; pos<total; pos++) {
         int token = (pos < n_prompt) ? ids[pos] : next_token;
         float *logits = forward(&w, &cfg, &s, token, pos);
+
+        if (pos == n_prompt - 1) {
+            /* Last prefill step done — record time to first generated token */
+            t_first_token = now_sec();
+        }
 
         if (pos < n_prompt-1) continue; /* prefill, no output yet */
 
@@ -1250,18 +1306,31 @@ int main(int argc, char *argv[]) {
             break;
         }
 
-        /* FIX 3: decode and print using raw bytes + known length.
-         * vocab[] stores decoded raw bytes; vocab_lens[] has the exact
-         * byte count.  Use fwrite so embedded NULs or non-ASCII bytes
-         * print correctly.  No Ġ special-casing needed — spaces are
-         * already 0x20 after decode_gpt2_token(). */
         if (tok.vocab[next_token] && tok.vocab_lens[next_token] > 0) {
             fwrite(tok.vocab[next_token], 1, tok.vocab_lens[next_token], stdout);
             fflush(stdout);
         }
+        n_generated++;
     }
 
-    printf("\n");
+    /* ── Timing report ──────────────────────────────────────────────── */
+    double t_end = now_sec();
+    double t_prefill  = t_first_token - t_prefill_start;   /* prompt processing */
+    double t_generate = t_end - t_first_token;              /* token generation  */
+    double tok_per_sec = (t_generate > 0 && n_generated > 0)
+                         ? (double)n_generated / t_generate
+                         : 0.0;
+
+    printf("\n\n══════════════════════════════════════\n");
+    printf("  Backend       : %s\n",    BLAS_BACKEND_NAME);
+    printf("  Prompt tokens : %d\n",   n_prompt);
+    printf("  Generated     : %d tokens\n", n_generated);
+    printf("  Prefill time  : %.2f s  (%.1f tok/s)\n",
+           t_prefill,
+           (t_prefill > 0 && n_prompt > 0) ? (double)n_prompt / t_prefill : 0.0);
+    printf("  Generate time : %.2f s\n", t_generate);
+    printf("  Throughput    : %.2f tok/s\n", tok_per_sec);
+    printf("══════════════════════════════════════\n");
 
     /* Cleanup */
     free_run_state(&s);
@@ -1279,3 +1348,8 @@ int main(int argc, char *argv[]) {
 
     return 0;
 }
+/*
+ gcc -O3 -march=native -DUSE_MKL -o llama_mkl nllama.c -lm -lmkl_rt \                                                                                                                     ─╯
+    -I/opt/intel/oneapi/mkl/latest/include
+ gcc -O3 -march=native -o llama_openblas nllama.c -lm -lopenblas       
+*/

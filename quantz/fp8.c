@@ -1,158 +1,152 @@
-///@file: fp8.c
+/// @file fp8.c  —  E4M3 FP8 arithmetic primitives
 #include <stdio.h>
 #include <stdint.h>
-#include <stdio.h>
 #include <time.h>
 #include <stdlib.h>
+#include <math.h>
+#include <string.h>
 #include "fp8.h"
-/**
-@note:
-    E4M3 has small range and good precision, so we will use this for activation
-    -> |1bit sign|4bit exponent|3bit mantisa|
-        sign = (fp8 >> 7) & 1
-        exp  = (fp8 >> 3) & 0xF
-        mant = fp8 & 0x7
-
-    E5M2 has large range but low precision, this can be used in weights
-    -> |1bit sign|5bit exponent|2bit mantisa|
-*/
 
 /*
-branchless version
-static const int mant_lookup[8] = {8,9,10,11,12,13,14,15};
-int M = mant_lookup[a & 0x7] * mant_lookup[b & 0x7];
-*/
-/// @brief branchless version
-/// @param a 
-/// @param b 
-/// @return fp8
-f8 fp8_mul(f8 a, f8 b){
-    int S = (a ^ b) & 0x80; //0x80 in binary is 10000000.
-    int E = ((a >> 3) & 0xF) + ((b >> 3) & 0xF) - 7;
-    int M = ((a & 0x7) | 8) * ((b & 0x7) | 8); // 8 == 1<<3
+ * Format recap (E4M3):
+ *   E4M3 → small range / good precision  → activations
+ *   E5M2 → large range / low  precision  → weights (future option)
+ *
+ *   |S|E3|E2|E1|E0|M2|M1|M0|
+ *     sign = (fp8 >> 7) & 1
+ *     exp  = (fp8 >> 3) & 0xF
+ *     mant =  fp8       & 0x7
+ */
 
-    int shift = M >> 7;   // 1 if M >= 128
-    M >>= shift;           
+/* ─────────────────────────── fp8_mul ───────────────────────────────── */
+/*
+ * Branchless integer multiply.
+ * Implicit-1 bit is OR'd into the mantissa before multiply,
+ * so mant is always in [8..15].  Product is in [64..225].
+ */
+f8 fp8_mul(f8 a, f8 b) {
+    int S = (a ^ b) & 0x80;                          /* result sign           */
+    int E = ((a >> 3) & 0xF) + ((b >> 3) & 0xF) - 7;/* exponent, rm one bias */
+    int M = ((a & 0x7) | 8) * ((b & 0x7) | 8);      /* implicit-1 multiply   */
+
+    int shift = M >> 7;   /* 1 if M ≥ 128 (result needs normalisation) */
+    M >>= shift;
     E += shift;
 
-    int mant = (M + 4) >> 3;
-    // Handle overflow mantissa
-    int overflow = mant >> 4;   // 1 if mant >= 16
-    mant &= 0xF;                // clamp to 0..15
+    int mant = (M + 4) >> 3;   /* round to 3 mantissa bits */
+    int overflow = mant >> 4;  /* 1 if mant spilled into bit 4 */
+    mant &= 0xF;
     E += overflow;
     E = (E <= 0) ? 0 : ((E >= 15) ? 15 : E);
-    return S | (E << 3) | (mant & 0x7);
+
+    return (f8)(S | (E << 3) | (mant & 0x7));
 }
 
-// Precompute all possible mantissa products with implicit 1 bit
-// Index = (mantA << 3) | mantB = 0..7 << 3 | 0..7 => 0..63
+/* ─────────────────────────── fp8_mul_precompt ──────────────────────── */
+/*
+ * Same result as fp8_mul, but the 8×8 mantissa product is read from a
+ * 64-entry lookup table — one cache line on any modern CPU.
+ * Slightly faster on scalar pipelines where multiply latency dominates.
+ *
+ * Index = (mantA << 3) | mantB   →  product including implicit-1 on both sides
+ */
 static const uint8_t mant_table[64] = {
-    8, 16, 24, 32, 40, 48, 56, 64,   // mantA=0
-    16, 18, 27, 36, 45, 54, 63, 72,  // mantA=1
-    24, 27, 32, 48, 60, 72, 84, 96,  // mantA=2
-    32, 36, 48, 64, 80, 96,112,128,  // mantA=3
-    40, 45, 60, 80,100,120,140,160,  // mantA=4
-    48, 54, 72, 96,120,144,168,192,  // mantA=5
-    56, 63, 84,112,140,168,196,224,  // mantA=6
-    64, 72, 96,128,160,192,224,255   // mantA=7
+/*        b=0   1    2    3    4    5    6    7          */
+/* a=0 */   8,  16,  24,  32,  40,  48,  56,  64,
+/* a=1 */  16,  18,  27,  36,  45,  54,  63,  72,
+/* a=2 */  24,  27,  32,  48,  60,  72,  84,  96,
+/* a=3 */  32,  36,  48,  64,  80,  96, 112, 128,
+/* a=4 */  40,  45,  60,  80, 100, 120, 140, 160,
+/* a=5 */  48,  54,  72,  96, 120, 144, 168, 192,
+/* a=6 */  56,  63,  84, 112, 140, 168, 196, 224,
+/* a=7 */  64,  72,  96, 128, 160, 192, 224, 255,
 };
 
-f8 fp8_mul_precompt(f8 a, f8 b){
-    // Sign
+f8 fp8_mul_precompt(f8 a, f8 b) {
     int S = (a ^ b) & 0x80;
-
-    // Exponent sum minus bias
     int E = ((a >> 3) & 0xF) + ((b >> 3) & 0xF) - 7;
 
-    // Mantissa product via lookup table
-    int idx = ((a & 0x7) << 3) | (b & 0x7);
+    int idx  = ((a & 0x7) << 3) | (b & 0x7);
     int mant = mant_table[idx];
 
-    // Normalize mantissa overflow
-    int shift = mant >> 7; // 1 if mant>=128
+    int shift = mant >> 7;   /* 1 if mant ≥ 128 */
     mant >>= shift;
     E += shift;
 
-    // Round and clamp mantissa
     mant = (mant + 4) >> 3;
     int overflow = mant >> 4;
     mant &= 0x7;
     E += overflow;
-
-    // Clamp exponent
     E = (E <= 0) ? 0 : ((E >= 15) ? 15 : E);
 
-    return S | (E << 3) | mant;
+    return (f8)(S | (E << 3) | mant);
 }
 
+/* ─────────────────────────── fp32_to_fp8 ───────────────────────────── */
 f8 fp32_to_fp8(float x) {
-    if (isnan(x))  return FP8_NAN;
+    if (isnan(x)) return FP8_NAN;
 
     uint32_t bits;
     memcpy(&bits, &x, 4);
 
     uint32_t sign = (bits >> 31) & 1u;
-    int32_t  exp  = (int32_t)((bits >> 23) & 0xFFu) - 127;  /* unbiased FP32 */
-    uint32_t mant = bits & 0x7FFFFFu;
+    int32_t  exp  = (int32_t)((bits >> 23) & 0xFFu) - 127;   /* unbiased */
+    uint32_t mant =  bits & 0x7FFFFFu;
 
-    /* clamp overflow to max finite */
-    if (exp > 8) {   /* > 448 in magnitude */
-        return (fp8_t)((sign << 7) | 0x7E);  /* ±448 */
-    }
+    /* overflow → clamp to ±max-finite (±448) */
+    if (exp > 8)  return (f8)((sign << 7) | 0x7Eu);
 
-    /* flush underflow (below min subnormal) to zero */
-    if (exp < -9) return (fp8_t)(sign << 7);
+    /* underflow → flush to ±0 */
+    if (exp < -9) return (f8)(sign << 7);
 
-    /* ── subnormal result ─── */
+    /* ── subnormal result ───────────────────────────────────────────── */
     if (exp < -6) {
-        /* shift mantissa right, implicit leading 1 included */
-        int shift = -6 - exp;          /* how far below normal boundary       */
-        uint32_t full_mant = (1u << 23) | mant;
-        uint32_t m8 = (full_mant >> (20 + shift));  /* keep 3 + guard bits   */
-        uint32_t round_bit = (full_mant >> (19 + shift)) & 1u;
-        uint32_t sticky    = (full_mant  & ((1u << (19 + shift)) - 1u)) != 0;
-        m8 += (round_bit & (m8 & 1u)) | (round_bit & sticky);  /* RNE        */
-        if (m8 > 7u) m8 = 7u;  /* subnormal overflow → clamp                 */
-        return (fp8_t)((sign << 7) | m8);
+        int      shift    = -6 - exp;
+        uint32_t full_m   = (1u << 23) | mant;
+        uint32_t m8       = full_m >> (20 + shift);
+        uint32_t round_b  = (full_m >> (19 + shift)) & 1u;
+        uint32_t sticky   = (full_m  & ((1u << (19 + shift)) - 1u)) != 0u;
+        m8 += (round_b & (m8 & 1u)) | (round_b & sticky);   /* RNE */
+        if (m8 > 7u) m8 = 7u;
+        return (f8)((sign << 7) | m8);
     }
 
-    /* ── normal result ─── */
-    int32_t e8 = exp + FP8_E4M3_BIAS;  /* re-bias for E4M3                   */
-    uint32_t m3     = mant >> 20;      /* top 3 bits of FP32 mantissa         */
+    /* ── normal result ──────────────────────────────────────────────── */
+    int32_t  e8     = exp + FP8_E4M3_BIAS;
+    uint32_t m3     = mant >> 20;
     uint32_t g_bit  = (mant >> 19) & 1u;
-    uint32_t sticky = (mant & 0x7FFFFu) != 0;
+    uint32_t sticky = (mant & 0x7FFFFu) != 0u;
 
     /* round-to-nearest-even */
     uint32_t round_up = g_bit & ((m3 & 1u) | sticky);
     m3 += round_up;
 
-    if (m3 > 7u) {           /* mantissa overflow → increment exponent        */
+    if (m3 > 7u) {         /* mantissa overflow → carry into exponent  */
         m3 = 0u;
         e8++;
-        if (e8 >= 15) {      /* NaN territory in E4M3 — clamp to max         */
-            return (fp8_t)((sign << 7) | 0x7E);
-        }
+        if (e8 >= 15) return (f8)((sign << 7) | 0x7Eu);   /* clamp    */
     }
 
-    return (fp8_t)((sign << 7) | ((uint32_t)e8 << 3) | m3);
+    return (f8)((sign << 7) | ((uint32_t)e8 << 3) | m3);
 }
 
+/* ─────────────────────────── fp8_to_fp32 ───────────────────────────── */
 float fp8_to_fp32(f8 v) {
-    if ((v & 0x7Fu) == 0x7Fu) return NAN;  /* E4M3 NaN                        */
+    /* NaN: e=15, m=7  (both sign variants) */
+    if ((v & 0x7Fu) == 0x7Fu) return NAN;
 
     uint32_t sign = (v >> 7) & 1u;
     uint32_t e8   = (v >> 3) & 0xFu;
     uint32_t m3   =  v       & 0x7u;
 
     float result;
-
     if (e8 == 0u) {
-        /* subnormal: value = (-1)^s * 2^(1-bias) * (m3/8) */
-        result = (float)m3 * (1.0f / 512.0f);   /* 2^(-9) * m3               */
+        /* subnormal: value = (-1)^s × 2^(1-7) × (m3/8) = m3 × 2^(-9) */
+        result = (float)m3 * (1.0f / 512.0f);
     } else {
-        /* normal: (-1)^s * 2^(e8-bias) * (1 + m3/8) */
-        float exp_val = ldexpf(1.0f, (int)e8 - FP8_E4M3_BIAS);
-        result = exp_val * (1.0f + (float)m3 / 8.0f);
+        /* normal:    value = (-1)^s × 2^(e8-7) × (1 + m3/8) */
+        result = ldexpf(1.0f, (int)e8 - FP8_E4M3_BIAS)
+               * (1.0f + (float)m3 / 8.0f);
     }
     return sign ? -result : result;
 }

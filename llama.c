@@ -1349,7 +1349,10 @@ int main(int argc, char *argv[]) {
     return 0;
 }
 /*
- gcc -O3 -march=native -DUSE_MKL -o llama_mkl nllama.c -lm -lmkl_rt \                                                                                                                     ─╯
-    -I/opt/intel/oneapi/mkl/latest/include
+ gcc -O3 -march=native -DUSE_MKL llama.c \
+-I/opt/intel/oneapi/mkl/2026.0/include \
+-L/opt/intel/oneapi/mkl/2026.0/lib \
+-lmkl_rt -lm \
+-o llama_mkl
  gcc -O3 -march=native -o llama_openblas nllama.c -lm -lopenblas       
 */

@@ -4,11 +4,6 @@
 #include <stdlib.h>
 #include "fp8.h"
 
-/// ── Optional feature gates ───────────────────────────────────────────────
-/// Compile with -DUSE_SIMD   to enable AVX2 / NEON paths
-/// Compile with -DUSE_THREADS to enable pthreads row-parallel path
-/// ─────────────────────────────────────────────────────────────────────────
-
 #ifdef USE_SIMD
 #  if defined(__AVX2__)
 #    include <immintrin.h>
@@ -23,15 +18,6 @@
 #  include <pthread.h>
 #endif
 
-
-/* ═══════════════════════════════════════════════════════════════════════════
- * 1.  SCALAR BASELINE
- *     out[i]  = Σ_j  W[i*in_dim + j]  *  x[j]        (FP8 × FP8 → fp32 acc)
- *     out[i] += Σ_j  W[i*in_dim + j]  *  x[j]        (accumulate variant)
- *
- *     Accumulation is done in fp32 to avoid catastrophic cancellation;
- *     we only stay in FP8 for the per-element multiply.
- * ═══════════════════════════════════════════════════════════════════════════ */
 
 void fp8_matmul_scalar(float *out, const f8 *x, const f8 *W,
                        int out_dim, int in_dim)
@@ -60,18 +46,6 @@ void fp8_matmul_scalar_acc(float *out, const f8 *x, const f8 *W,
     }
 }
 
-
-/* ═══════════════════════════════════════════════════════════════════════════
- * 2.  DEQUANTISE-THEN-SGEMV  (fast-path scalar)
- *
- *     Widening the full row to fp32 up-front lets the inner loop use plain
- *     fp32 FMA, which is far cheaper than per-pair fp8_mul + fp8_to_fp32.
- *     Stack-allocate a row buffer so there is no heap traffic per call.
- *
- *     Threshold: break-even vs pure-FP8 path is ≈ in_dim > 32 on most uarches.
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-/* Maximum stack buffer (bytes). Rows wider than this fall back to scalar.   */
 #define FP8_ROW_STACK_LIMIT  4096
 
 void fp8_matmul_deq(float *out, const f8 *x, const f8 *W,
@@ -119,23 +93,6 @@ void fp8_matmul_deq_acc(float *out, const f8 *x, const f8 *W,
     if (x_f32 != x_f32_stack) free(x_f32);
 }
 
-
-/* ═══════════════════════════════════════════════════════════════════════════
- * 3.  SIMD PATHS
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-/* ───────────────────────────────────────────────────────────────────────────
- * 3a.  AVX2  (x86-64)
- *
- *  Strategy:
- *   • Dequantise 8 FP8 bytes → 8 fp32 lanes using _mm256_cvtepu8_epi32 +
- *     a manual unpack (no hardware FP8→FP32 until AVX-512-FP8 / H100 class).
- *   • Inner loop processes 8 elements per iteration via 256-bit FMA.
- *   • Tail (in_dim % 8) handled by scalar.
- *
- *  The deq helper converts 8 packed E4M3 bytes held in the low 64 bits of
- *  an __m128i into an __m256 of fp32 values.
- * ─────────────────────────────────────────────────────────────────────────── */
 #ifdef HAVE_AVX2
 
 /* Expand 8-bit E4M3 → fp32  (8 elements at a time) */
@@ -217,12 +174,6 @@ static void fp8_matmul_avx2_row(float *out, const float *x_f32,
 #endif /* HAVE_AVX2 */
 
 
-/* ───────────────────────────────────────────────────────────────────────────
- * 3b.  ARM NEON  (AArch64)
- *
- *  Strategy identical to AVX2 but uses 4-wide float32x4_t lanes.
- *  Inner loop: 8 FP8 bytes → two float32x4_t → two vfmaq_f32 per iteration.
- * ─────────────────────────────────────────────────────────────────────────── */
 #ifdef HAVE_NEON
 
 /* Expand 4 packed E4M3 bytes (low 4 of an uint8x8_t) → float32x4_t */
@@ -297,12 +248,6 @@ static void fp8_matmul_neon_row(float *out, const float *x_f32,
 #endif /* HAVE_NEON */
 
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * 4.  THREADED WRAPPER  (pthreads, row-parallel)
- *
- *  Each thread owns a contiguous stripe of output rows.
- *  The inner kernel per thread is whichever SIMD path compiled in.
- * ═══════════════════════════════════════════════════════════════════════════ */
 #ifdef USE_THREADS
 
 #define FP8_MAX_THREADS 16

@@ -19,11 +19,6 @@
  */
 
 /* ─────────────────────────── fp8_mul ───────────────────────────────── */
-/*
- * Branchless integer multiply.
- * Implicit-1 bit is OR'd into the mantissa before multiply,
- * so mant is always in [8..15].  Product is in [64..225].
- */
 f8 fp8_mul(f8 a, f8 b) {
     int S = (a ^ b) & 0x80;                          /* result sign           */
     int E = ((a >> 3) & 0xF) + ((b >> 3) & 0xF) - 7;/* exponent, rm one bias */
@@ -40,46 +35,6 @@ f8 fp8_mul(f8 a, f8 b) {
     E = (E <= 0) ? 0 : ((E >= 15) ? 15 : E);
 
     return (f8)(S | (E << 3) | (mant & 0x7));
-}
-
-/* ─────────────────────────── fp8_mul_precompt ──────────────────────── */
-/*
- * Same result as fp8_mul, but the 8×8 mantissa product is read from a
- * 64-entry lookup table — one cache line on any modern CPU.
- * Slightly faster on scalar pipelines where multiply latency dominates.
- *
- * Index = (mantA << 3) | mantB   →  product including implicit-1 on both sides
- */
-static const uint8_t mant_table[64] = {
-/*        b=0   1    2    3    4    5    6    7          */
-/* a=0 */   8,  16,  24,  32,  40,  48,  56,  64,
-/* a=1 */  16,  18,  27,  36,  45,  54,  63,  72,
-/* a=2 */  24,  27,  32,  48,  60,  72,  84,  96,
-/* a=3 */  32,  36,  48,  64,  80,  96, 112, 128,
-/* a=4 */  40,  45,  60,  80, 100, 120, 140, 160,
-/* a=5 */  48,  54,  72,  96, 120, 144, 168, 192,
-/* a=6 */  56,  63,  84, 112, 140, 168, 196, 224,
-/* a=7 */  64,  72,  96, 128, 160, 192, 224, 255,
-};
-
-f8 fp8_mul_precompt(f8 a, f8 b) {
-    int S = (a ^ b) & 0x80;
-    int E = ((a >> 3) & 0xF) + ((b >> 3) & 0xF) - 7;
-
-    int idx  = ((a & 0x7) << 3) | (b & 0x7);
-    int mant = mant_table[idx];
-
-    int shift = mant >> 7;   /* 1 if mant ≥ 128 */
-    mant >>= shift;
-    E += shift;
-
-    mant = (mant + 4) >> 3;
-    int overflow = mant >> 4;
-    mant &= 0x7;
-    E += overflow;
-    E = (E <= 0) ? 0 : ((E >= 15) ? 15 : E);
-
-    return (f8)(S | (E << 3) | mant);
 }
 
 /* ─────────────────────────── fp32_to_fp8 ───────────────────────────── */
@@ -149,4 +104,28 @@ float fp8_to_fp32(f8 v) {
                * (1.0f + (float)m3 / 8.0f);
     }
     return sign ? -result : result;
+}
+
+f8 fp8_add(f8 a, f8 b) {
+    return fp32_to_fp8(fp8_to_fp32(a) + fp8_to_fp32(b));
+}
+
+void fp32_buf_to_fp8(const float *src, f8 *dst, int n,
+                                    float *scale_out) {
+    float amax = 0.0f;
+    for (int i = 0; i < n; i++) {
+        float a = fabsf(src[i]);
+        if (a > amax) amax = a;
+    }
+    /* FP8 E4M3 max finite = 448 */
+    float scale = (amax > 0.0f) ? (448.0f / amax) : 1.0f;
+    if (scale_out) *scale_out = 1.0f / scale;   /* store dequant scale */
+    for (int i = 0; i < n; i++)
+        dst[i] = fp32_to_fp8(src[i] * scale);
+}
+
+void fp8_buf_to_fp32(const f8 *src, float *dst, int n,
+                                    float scale) {
+    for (int i = 0; i < n; i++)
+        dst[i] = fp8_to_fp32(src[i]) * scale;
 }

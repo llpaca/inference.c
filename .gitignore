@@ -9,3 +9,5 @@ tokenizer
 *.bin
 bpe
 corpus.txt
+.env
+*.jar

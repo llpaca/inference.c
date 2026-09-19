@@ -3,3 +3,9 @@ llama
 llama_openblas
 builds/
 .ref
+llama
+llama_mkl
+tokenizer
+*.bin
+bpe
+corpus.txt
